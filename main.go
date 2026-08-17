@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -23,7 +24,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+const (
+	version = "0.1.0"
+)
+
 var cdict *gozstd.CDict
+var commonMetadata map[string]any
+var hostname string
 
 func compressHTML(html string) []byte {
 	compressedData := gozstd.CompressDict(nil, []byte(html), cdict)
@@ -61,9 +68,9 @@ func AddFileToFrame(writer *bundler.BundleWriter, item QueueItem) error {
 func ProcessQueueSingle(ctx context.Context) (string, error) {
 	// create a working file
 	now := time.Now()
-	startUnix := now.Unix()
+	startUnix := now.UnixMilli()
 
-	bundleFileName := fmt.Sprintf("bundle_%d.bundle.part", startUnix)
+	bundleFileName := fmt.Sprintf("bundle_%s_%d.bundle.part", hostname, startUnix)
 	bundleFile, err := os.Create(bundleFileName)
 
 	if err != nil {
@@ -72,10 +79,16 @@ func ProcessQueueSingle(ctx context.Context) (string, error) {
 
 	defer bundleFile.Close()
 
+	metadata := map[string]any{
+		"timestamp": startUnix,
+	}
+
+	for k, v := range commonMetadata {
+		metadata[k] = v
+	}
+
 	// open file writer and use it to create a bundle writer
-	writer, err := bundler.NewBundle(bundleFile, map[string]any{
-		"timestamp": now.UnixMilli(),
-	})
+	writer, err := bundler.NewBundle(bundleFile, metadata)
 	if err != nil {
 		return "", fmt.Errorf("Failed to create bundle writer: %v", err)
 	}
@@ -135,7 +148,7 @@ loop:
 	}
 
 	// rename the file to remove the .part extension
-	finalBundleFileName := fmt.Sprintf("bundle_%d.bundle", startUnix)
+	finalBundleFileName := fmt.Sprintf("bundle_%s_%d.bundle", hostname, startUnix)
 	err = os.Rename(bundleFileName, finalBundleFileName)
 	if err != nil {
 		return "", fmt.Errorf("Failed to rename bundle file: %v", err)
@@ -166,7 +179,7 @@ func UploadBundle(context context.Context, client *transfermanager.Client, bucke
 	return nil
 }
 
-func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketName string) {
+func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketName string, local bool) {
 	shutdownRequested := false
 
 	for {
@@ -180,6 +193,7 @@ func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketN
 			fmt.Printf("Error processing queue: %v\n", err)
 			if shutdownRequested {
 				uploadWG.Wait()
+
 				return
 			}
 			continue
@@ -193,25 +207,27 @@ func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketN
 			continue
 		}
 
-		uploadWG.Add(1)
-		go func(bundlePath string) {
-			defer uploadWG.Done()
+		if !local {
+			uploadWG.Add(1)
+			go func(bundlePath string) {
+				defer uploadWG.Done()
 
-			fmt.Printf("Uploading bundle: %s\n", bundlePath)
-			err := UploadBundle(context.Background(), uploader, bucketName, bundlePath)
-			if err != nil {
-				fmt.Printf("Error uploading bundle: %v\n", err)
-			} else {
-				// delete the file after successful upload
-				err := os.Remove(bundlePath)
+				fmt.Printf("Uploading bundle: %s\n", bundlePath)
+				err := UploadBundle(context.Background(), uploader, bucketName, bundlePath)
 				if err != nil {
-					fmt.Printf("Error deleting bundle file: %v\n", err)
+					fmt.Printf("Error uploading bundle: %v\n", err)
+				} else {
+					// delete the file after successful upload
+					err := os.Remove(bundlePath)
+					if err != nil {
+						fmt.Printf("Error deleting bundle file: %v\n", err)
+					}
 				}
-			}
-		}(bundleFileName)
+			}(bundleFileName)
 
-		if shutdownRequested {
-			continue
+			if shutdownRequested {
+				continue
+			}
 		}
 	}
 }
@@ -257,7 +273,7 @@ func parseSize(sizeStr string) (uint64, error) {
 func main() {
 	gin.SetMode(gin.ReleaseMode)
 
-	parser := argparse.NewParser("geulgyeol-html-precompressor", "A HTML pre-compressing server for Geulgyeol.")
+	parser := argparse.NewParser("html-bundler", "Bundles crawled HTML files into a single efficient bundle, and upload them to S3-compatible object storage.")
 
 	port := parser.Int("p", "port", &argparse.Options{Default: 8080, Help: "Port to run the server on"})
 	zstdDictionaryPath := parser.String("z", "zstd-dictionary", &argparse.Options{Default: "./zstd_dict_v2", Help: "Path to Zstd dictionary file"})
@@ -265,10 +281,22 @@ func main() {
 	timeThreshold := parser.String("t", "time-threshold", &argparse.Options{Default: "3h", Help: "Time threshold for bundle files (e.g., 3h, 30m. supported units: h, m, s)"})
 	s3PartSize := parser.Int("b", "s3-part-size", &argparse.Options{Default: 64, Help: "S3 part size in MiB for multipart uploads"})
 	s3Concurrency := parser.Int("c", "s3-concurrency", &argparse.Options{Default: 8, Help: "S3 concurrency for multipart uploads"})
+	local := parser.Flag("l", "local", &argparse.Options{Help: "Run in local mode without S3 upload, keeping the bundle files in the current directory."})
 
 	err := parser.Parse(os.Args)
 	if err != nil {
 		panic(err)
+	}
+
+	hostname, err = os.Hostname()
+	if err != nil {
+		fmt.Printf("Failed to get hostname: %v\n", err)
+		hostname = "unknown"
+	}
+
+	commonMetadata = map[string]any{
+		"created_by": fmt.Sprintf("html-bundler v%s (go %s, %s/%s)", version, runtime.Version(), runtime.GOOS, runtime.GOARCH),
+		"host":       hostname,
 	}
 
 	if *sizeThreshold != "" {
@@ -337,7 +365,7 @@ func main() {
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
-		ProcessQueue(ctx, uploader, s3Bucket)
+		ProcessQueue(ctx, uploader, s3Bucket, *local)
 	}()
 
 	r := gin.Default()
@@ -367,44 +395,6 @@ func main() {
 			Body:      compressedHTML,
 			Blog:      body.Blog,
 			Timestamp: body.Timestamp,
-		}
-
-		c.JSON(200, gin.H{"status": "success"})
-	})
-
-	r.POST("/batch", func(c *gin.Context) {
-		var body map[string]struct {
-			Body      string `json:"body"`
-			Blog      string `json:"blog"`
-			Timestamp uint64 `json:"timestamp"`
-		}
-
-		if err := c.BindJSON(&body); err != nil {
-			c.JSON(400, gin.H{"error": "Invalid JSON"})
-			return
-		}
-
-		// concurrently compress and enqueue, but respond after all items are enqueued
-		compressedItems := make(chan QueueItem, len(body))
-
-		for url, item := range body {
-			go func(url string, item struct {
-				Body      string `json:"body"`
-				Blog      string `json:"blog"`
-				Timestamp uint64 `json:"timestamp"`
-			}) {
-				compressedHTML := compressHTML(item.Body)
-				compressedItems <- QueueItem{
-					Url:       url,
-					Body:      compressedHTML,
-					Blog:      item.Blog,
-					Timestamp: item.Timestamp,
-				}
-			}(url, item)
-		}
-
-		for i := 0; i < len(body); i++ {
-			queue <- <-compressedItems
 		}
 
 		c.JSON(200, gin.H{"status": "success"})
