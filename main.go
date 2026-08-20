@@ -228,6 +228,8 @@ func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketN
 			if shutdownRequested {
 				continue
 			}
+		} else {
+			fmt.Printf("Bundle created, skipping upload: %s\n", bundleFileName)
 		}
 	}
 }
@@ -326,38 +328,43 @@ func main() {
 		panic(fmt.Sprintf("Failed to create Zstd dictionary: %v", err))
 	}
 
-	// get the required environment variables
-	accountId := os.Getenv("S3_ACCOUNT_ID")
-	accessKeyId := os.Getenv("S3_ACCESS_KEY_ID")
-	accessKeySecret := os.Getenv("S3_SECRET_ACCESS_KEY")
-	s3Region := os.Getenv("S3_REGION") // optional, default to "auto"
-	s3Endpoint := os.Getenv("S3_ENDPOINT")
-	s3Bucket := os.Getenv("S3_BUCKET")
+	var uploader *transfermanager.Client
+	var s3Bucket string
 
-	if accountId == "" || accessKeyId == "" || accessKeySecret == "" || s3Bucket == "" {
-		panic("S3_ACCOUNT_ID, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, and S3_BUCKET environment variables must be set")
+	if !*local {
+		// get the required environment variables
+		accountId := os.Getenv("S3_ACCOUNT_ID")
+		accessKeyId := os.Getenv("S3_ACCESS_KEY_ID")
+		accessKeySecret := os.Getenv("S3_SECRET_ACCESS_KEY")
+		s3Region := os.Getenv("S3_REGION") // optional, default to "auto"
+		s3Endpoint := os.Getenv("S3_ENDPOINT")
+		s3Bucket = os.Getenv("S3_BUCKET")
+
+		if accountId == "" || accessKeyId == "" || accessKeySecret == "" || s3Bucket == "" {
+			panic("S3_ACCOUNT_ID, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, and S3_BUCKET environment variables must be set")
+		}
+
+		if s3Region == "" {
+			s3Region = "auto"
+		}
+
+		cfg, err := config.LoadDefaultConfig(context.TODO(),
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKeyId, accessKeySecret, "")),
+			config.WithRegion(s3Region), // Required by SDK but not used by R2
+		)
+		if err != nil {
+			panic(fmt.Sprintf("Failed to load AWS SDK config: %v", err))
+		}
+
+		client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(s3Endpoint)
+		})
+
+		uploader = transfermanager.New(client, func(u *transfermanager.Options) {
+			u.PartSizeBytes = int64(*s3PartSize * 1024 * 1024) // 64MiB per chunk for default
+			u.Concurrency = *s3Concurrency                     // 8 concurrent HTTP connections for default
+		})
 	}
-
-	if s3Region == "" {
-		s3Region = "auto"
-	}
-
-	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKeyId, accessKeySecret, "")),
-		config.WithRegion(s3Region), // Required by SDK but not used by R2
-	)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to load AWS SDK config: %v", err))
-	}
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(s3Endpoint)
-	})
-
-	uploader := transfermanager.New(client, func(u *transfermanager.Options) {
-		u.PartSizeBytes = int64(*s3PartSize * 1024 * 1024) // 64MiB per chunk for default
-		u.Concurrency = *s3Concurrency                     // 8 concurrent HTTP connections for default
-	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
