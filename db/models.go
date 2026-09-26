@@ -8,13 +8,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type BlogUser struct {
-	BlogPlatform   string           `json:"blog_platform"`
-	UserID         string           `json:"user_id"`
-	LastEnqueuedAt pgtype.Timestamp `json:"last_enqueued_at"`
-	CreatedAt      pgtype.Timestamp `json:"created_at"`
-}
-
 type Bundle struct {
 	ID        int64            `json:"id"`
 	ObjectKey string           `json:"object_key"`
@@ -25,4 +18,11 @@ type BundleEntry struct {
 	BundleID    int64  `json:"bundle_id"`
 	FrameOffset int64  `json:"frame_offset"`
 	Url         string `json:"url"`
+}
+
+type User struct {
+	BlogPlatform   string           `json:"blog_platform"`
+	UserID         string           `json:"user_id"`
+	LastEnqueuedAt pgtype.Timestamp `json:"last_enqueued_at"`
+	CreatedAt      pgtype.Timestamp `json:"created_at"`
 }

@@ -17,9 +17,9 @@ CREATE TABLE IF NOT EXISTS bundle_entries (
 CREATE INDEX bundle_entries_url_idx
     ON bundle_entries USING HASH (url);
 
--- blog_users table stores users of the blog platforms for re-crawling purposes
+-- users table stores users of the blog platforms for re-crawling purposes
 
-CREATE TABLE IF NOT EXISTS blog_users (
+CREATE TABLE IF NOT EXISTS users (
     blog_platform text not null,
     user_id text not null,
     last_enqueued_at timestamp not null default current_timestamp,
