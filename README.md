@@ -8,6 +8,13 @@ Bundles crawled HTML files into a single efficient bundle, and upload them to S3
   - Each node directly writes to object storage, reducing network traffic and storage burden
 - Natively built for object storage without providing read access
 - Highly efficient compression of HTML files using zstd w. dictionary
+- Indexes bundle object keys, frame offsets, and URLs in PostgreSQL
+
+### PostgreSQL index
+
+Set `DATABASE_URL` to a PostgreSQL connection string (for example, `postgres://user:password@host:5432/database`). Apply `schema.sql` to the database before starting the service. A database connection is required in both S3 and `--local` modes.
+
+The service indexes each completed bundle after uploading it (or after writing it in local mode). If uploading or indexing fails, the completed `.bundle` file is retained in the working directory; on the next start, retained bundles are retried. Use a persistent working directory in S3 mode if restart recovery is needed. Partial `.bundle.part` files are not recovered.
 
 ## Bundle spec
 

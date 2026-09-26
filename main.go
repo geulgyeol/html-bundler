@@ -15,6 +15,7 @@ import (
 	"github.com/akamensky/argparse"
 	"github.com/geulgyeol/html-bundler/bundler"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/valyala/gozstd"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -65,16 +66,16 @@ func AddFileToFrame(writer *bundler.BundleWriter, item QueueItem) error {
 	return nil
 }
 
-func ProcessQueueSingle(ctx context.Context) (string, error) {
+func ProcessQueueSingle(ctx context.Context) (string, []bundleEntry, error) {
 	// create a working file
 	now := time.Now()
 	startUnix := now.UnixMilli()
 
-	bundleFileName := fmt.Sprintf("bundle_%s_%d.bundle.part", hostname, startUnix)
+	bundleFileName := fmt.Sprintf("bundle_%d_%s.bundle.part", startUnix, hostname)
 	bundleFile, err := os.Create(bundleFileName)
 
 	if err != nil {
-		return "", fmt.Errorf("Failed to create bundle file: %v", err)
+		return "", nil, fmt.Errorf("Failed to create bundle file: %v", err)
 	}
 
 	defer bundleFile.Close()
@@ -90,7 +91,17 @@ func ProcessQueueSingle(ctx context.Context) (string, error) {
 	// open file writer and use it to create a bundle writer
 	writer, err := bundler.NewBundle(bundleFile, metadata)
 	if err != nil {
-		return "", fmt.Errorf("Failed to create bundle writer: %v", err)
+		return "", nil, fmt.Errorf("Failed to create bundle writer: %v", err)
+	}
+
+	var entries []bundleEntry
+	recordFrame := func(item QueueItem) error {
+		offset := writer.Length
+		if err := AddFileToFrame(writer, item); err != nil {
+			return err
+		}
+		entries = append(entries, bundleEntry{Offset: int64(offset), URL: item.Url})
+		return nil
 	}
 
 	timeout := time.NewTimer(bundleTimeThreshold)
@@ -106,7 +117,7 @@ loop:
 				if !ok {
 					break loop
 				}
-				err := AddFileToFrame(writer, item)
+				err := recordFrame(item)
 				if err != nil {
 					fmt.Printf("Failed to add file to frame: %v", err)
 				}
@@ -119,7 +130,8 @@ loop:
 			if !ok {
 				break loop
 			}
-			err := AddFileToFrame(writer, item)
+
+			err := recordFrame(item)
 			if err != nil {
 				fmt.Printf("Failed to add file to frame: %v", err)
 			}
@@ -135,26 +147,26 @@ loop:
 	// close the bundle writer
 	err = writer.Close()
 	if err != nil {
-		return "", fmt.Errorf("Failed to close bundle writer: %v", err)
+		return "", nil, fmt.Errorf("Failed to close bundle writer: %v", err)
 	}
 
 	if writer.Count == 0 {
 		// no items were added to the bundle, delete the file and return
 		err = os.Remove(bundleFileName)
 		if err != nil {
-			return "", fmt.Errorf("Failed to remove empty bundle file: %v", err)
+			return "", nil, fmt.Errorf("Failed to remove empty bundle file: %v", err)
 		}
-		return "", nil
+		return "", nil, nil
 	}
 
 	// rename the file to remove the .part extension
 	finalBundleFileName := fmt.Sprintf("bundle_%s_%d.bundle", hostname, startUnix)
 	err = os.Rename(bundleFileName, finalBundleFileName)
 	if err != nil {
-		return "", fmt.Errorf("Failed to rename bundle file: %v", err)
+		return "", nil, fmt.Errorf("Failed to rename bundle file: %v", err)
 	}
 
-	return finalBundleFileName, nil
+	return finalBundleFileName, entries, nil
 }
 
 func UploadBundle(context context.Context, client *transfermanager.Client, bucketName string, filePath string) error {
@@ -179,7 +191,24 @@ func UploadBundle(context context.Context, client *transfermanager.Client, bucke
 	return nil
 }
 
-func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketName string, local bool) {
+func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketName string, local bool, pool *pgxpool.Pool) {
+	finish := func(ctx context.Context, path string, entries []bundleEntry, local bool) error {
+		if !local {
+			if err := UploadBundle(ctx, uploader, bucketName, path); err != nil {
+				return err
+			}
+		}
+		if err := indexBundle(ctx, pool, path, entries); err != nil {
+			return fmt.Errorf("index bundle %s: %w", path, err)
+		}
+		if !local {
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("delete uploaded bundle %s: %w", path, err)
+			}
+		}
+		return nil
+	}
+	recoverBundles(finish, local)
 	shutdownRequested := false
 
 	for {
@@ -188,7 +217,7 @@ func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketN
 			shutdownRequested = true
 		}
 
-		bundleFileName, err := ProcessQueueSingle(ctx)
+		bundleFileName, entries, err := ProcessQueueSingle(ctx)
 		if err != nil {
 			fmt.Printf("Error processing queue: %v\n", err)
 			if shutdownRequested {
@@ -207,30 +236,13 @@ func ProcessQueue(ctx context.Context, uploader *transfermanager.Client, bucketN
 			continue
 		}
 
-		if !local {
-			uploadWG.Add(1)
-			go func(bundlePath string) {
-				defer uploadWG.Done()
-
-				fmt.Printf("Uploading bundle: %s\n", bundlePath)
-				err := UploadBundle(context.Background(), uploader, bucketName, bundlePath)
-				if err != nil {
-					fmt.Printf("Error uploading bundle: %v\n", err)
-				} else {
-					// delete the file after successful upload
-					err := os.Remove(bundlePath)
-					if err != nil {
-						fmt.Printf("Error deleting bundle file: %v\n", err)
-					}
-				}
-			}(bundleFileName)
-
-			if shutdownRequested {
-				continue
+		uploadWG.Add(1)
+		go func(bundlePath string, entries []bundleEntry) {
+			defer uploadWG.Done()
+			if err := finish(context.Background(), bundlePath, entries, local); err != nil {
+				fmt.Printf("Error finishing bundle: %v\n", err)
 			}
-		} else {
-			fmt.Printf("Bundle created, skipping upload: %s\n", bundleFileName)
-		}
+		}(bundleFileName, entries)
 	}
 }
 
@@ -328,6 +340,19 @@ func main() {
 		panic(fmt.Sprintf("Failed to create Zstd dictionary: %v", err))
 	}
 
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		panic("DATABASE_URL must be set")
+	}
+	pool, err := pgxpool.New(context.Background(), databaseURL)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to configure PostgreSQL: %v", err))
+	}
+	defer pool.Close()
+	if err := pool.Ping(context.Background()); err != nil {
+		panic(fmt.Sprintf("Failed to connect to PostgreSQL: %v", err))
+	}
+
 	var uploader *transfermanager.Client
 	var s3Bucket string
 
@@ -372,7 +397,7 @@ func main() {
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
-		ProcessQueue(ctx, uploader, s3Bucket, *local)
+		ProcessQueue(ctx, uploader, s3Bucket, *local, pool)
 	}()
 
 	r := gin.Default()
